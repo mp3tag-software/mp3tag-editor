@@ -1,0 +1,1590 @@
+# Plugin API Reference
+
+This document provides a complete reference for the `PluginApi` class, which is the main interface for plugins to interact with Picard.
+
+---
+
+## Overview
+
+The `PluginApi` object is passed to your plugin's `enable()` function and provides access to all Picard functionality:
+
+```python
+def enable(api):
+    """Entry point for the plugin (required)."""
+    api.logger.info("Plugin loaded")
+    api.register_track_metadata_processor(my_processor)
+
+
+def disable():
+    """Optional cleanup when plugin is disabled."""
+    # Custom cleanup code here
+    pass
+```
+
+**Required**: `enable(api)` - Called when plugin is enabled
+**Optional**: `disable()` - Called when plugin is disabled (before automatic cleanup)
+
+**Note**: All registrations (`api.register_*`) are automatically removed when the plugin is disabled. The `disable()` function is only needed for custom cleanup (closing connections, stopping threads, etc.).
+
+---
+
+## Getting API Instance
+
+### `PluginApi.get_api()` (class method)
+
+Get the `PluginApi` instance from anywhere in your plugin code without explicitly passing it around.
+
+```python
+from picard.plugin3.api import PluginApi
+
+
+class MyWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        # Get API instance without passing it through constructors
+        api = PluginApi.get_api()
+        api.logger.info("Widget initialized")
+
+        # Use API methods
+        self.plugin_config = api.plugin_config
+        self.logger = api.logger
+```
+
+**Returns**: `PluginApi` - The API instance for the calling plugin module
+
+**Raises**: `RuntimeError` - If called from outside a plugin context
+
+**How it works**:
+- Inspects the call stack to determine which plugin module is calling
+- Returns the cached API instance for that module
+- Works from main plugin module and any submodules
+- First call per module does stack inspection, subsequent calls use cache
+
+**Use cases**:
+- Classes that don't receive `api` parameter (widgets, dialogs, utility classes)
+- Avoiding passing `api` through multiple constructor levels
+- Accessing API from helper modules
+
+**Note**: This is a convenience method. For the main `enable()` function and classes that naturally receive the API (like `BaseAction`), use the passed `api` parameter directly.
+
+---
+
+## Class References
+
+The following classes are available through the `api` module:
+
+- `Album` - Album object
+- `Track` - Track object
+- `File` - File base class (for custom formats)
+- `Cluster` - Cluster object
+- `DebugOpt` - Debug option enum for conditional logging
+- `Metadata` - Metadata container for tags
+- `BaseAction` - Base class for UI actions
+- `MetadataTagAction` - Base class for metadata tag context menu actions
+- `OptionsPage` - Base class for options pages
+- `CoverArtImage` - Cover art image object
+- `CoverArtProvider` - Base class for cover art providers
+- `ProviderOptions` - Base class for cover art provider option pages
+- `ScriptParser` - A parser for parsing tagger scripts
+
+**Example**:
+```python
+from picard.plugin3.api import (
+    BaseAction,
+    CoverArtProvider,
+    File,
+    Metadata,
+    MetadataTagAction,
+    OptionsPage,
+)
+
+
+class MyProvider(CoverArtProvider):
+    NAME = "My Provider"
+
+
+class MyFormat(File):
+    NAME = "Custom Format"
+    EXTENSIONS = [".custom"]
+
+    def _load(self, filename):
+        metadata = Metadata()
+        # Load tags into metadata
+        return metadata
+```
+
+**Note**: Classes that are considered part of the API like `Metadata`, `Track`, `Album`,
+etc. should be imported directly from `picard.plugin3.api` instead from elsewhere
+in Picard.
+
+---
+
+## Properties
+
+### `tagger`
+
+Access to the main Tagger instance.
+
+```python
+def enable(api):
+    # Load a release by MBID into Picard
+    api.tagger.load_album('b84ee12a-09ef-421b-82de-0441a926375b')
+
+    # Access window
+    window = api.tagger.window
+```
+
+**Common uses**:
+- `api.tagger.load_album(mbid)` - Load a release by MBID into Picard
+- `api.tagger.load_nat(mbid)` - Load a recording by MBID into Picard
+- `api.tagger.move_file_to_album(file, albumid)` - Move a file to a release
+- `api.tagger.move_file_to_track(file, albumid, recordingid)` - Move a file to a specific recording on a release
+- `api.tagger.move_file_to_nat(file, recordingid)` - Move a file to a specific recording
+- `api.tagger.add_files(filenames)` - Load the specified files into Picard
+- `api.tagger.cluster(objs)` - Run the clustering over all files from `objs`
+- `api.tagger.window` - Access main window for dialogs
+
+---
+
+### `plugin_id: str`
+
+Plugin identifier (module name).
+
+```python
+def enable(api):
+    api.logger.info(f"Plugin {api.plugin_id} loaded")
+```
+
+**Value**: The plugin's module name (e.g., `'listenbrainz'`, `'my-plugin'`)
+
+---
+
+### `logger: PluginLogger`
+
+Plugin-specific logger instance.
+
+Provides standard logging methods (`debug`, `info`, `warning`, `error`, `exception`)
+plus `debug_if()` for conditional debug logging gated on debug options.
+
+```python
+from picard.plugin3.api import DebugOpt
+
+
+def enable(api):
+    # Standard logging
+    api.logger.debug("Debug message")
+    api.logger.info("Info message")
+    api.logger.warning("Warning message")
+    api.logger.error("Error message")
+
+    # Conditional debug logging (only logs when the option is enabled)
+    api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT, "Processing: %s", item)
+
+    # Lazy formatting (expensive_call() only runs if option is enabled)
+    api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT, msg_func=lambda: "State: %s" % expensive_call())
+
+    # Block guard — skip expensive code entirely when disabled
+    if dbg := api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT):
+        for item in items:
+            dbg("item: %r", item)
+```
+
+**Namespace**: Logs are prefixed with `plugin.{module_name}`
+
+#### `debug_if(debug_opt, msg=None, *args, msg_func=None, **kwargs)`
+
+Log a debug message only if the specified debug option is enabled. Users enable
+debug options via `--debug-opts=plugin_development` on the command line.
+
+**Parameters**:
+- `debug_opt`: A `DebugOpt` enum value (e.g., `DebugOpt.PLUGIN_DEVELOPMENT`)
+- `msg`: Format string (optional if using as guard or with `msg_func`)
+- `*args`: Arguments for the format string
+- `msg_func`: Callable returning the message string, only called if the option is
+  enabled. Mutually exclusive with `msg`/`args`.
+
+**Returns**: A truthy callable if enabled (can be used as a logger), a falsy no-op
+if disabled. This enables the walrus-operator guard pattern shown above.
+
+#### Available debug options
+
+| Option | Constant | Description |
+|---|---|---|
+| `plugin_development` | `DebugOpt.PLUGIN_DEVELOPMENT` | General plugin development logging |
+| `coverart` | `DebugOpt.COVERART` | Cover art operations |
+| `matching` | `DebugOpt.MATCHING` | Similarity scores and match decisions |
+
+Use `DebugOpt.PLUGIN_DEVELOPMENT` for general plugin debug output. If your plugin
+is specifically related to a domain (cover art, matching, etc.), use the
+corresponding option for consistency with Picard's own logging.
+
+**Import**: `from picard.plugin3.api import DebugOpt`
+
+---
+
+### `global_config: Config`
+
+Access to Picard's global configuration.
+
+```python
+def my_processor(api, album, metadata, release):
+    # Read settings
+    enabled = api.global_config.setting.get('my_plugin_enabled', False)
+
+    # Write settings
+    api.global_config.setting['my_plugin_enabled'] = True
+```
+
+**Common settings**:
+- `api.global_config.setting['server_host']` - MusicBrainz server
+- `api.global_config.setting['server_port']` - Server port
+- `api.global_config.setting['username']` - MusicBrainz username
+
+---
+
+### `plugin_config: ConfigSection`
+
+Plugin-private configuration section.
+
+```python
+def enable(api):
+    # Register options with default value
+    api.plugin_config.register_option('text_option', 'value')
+    api.plugin_config.register_option('bool_option', True)
+    api.plugin_config.register_option('int_option', 42)
+    api.plugin_config.register_option('list_option', ['a', 'b', 'c'])
+
+    # Write values (any JSON-serializable type)
+    api.plugin_config['text_option'] = 'value'
+    api.plugin_config['bool_option'] = True
+    api.plugin_config['int_option'] = 42
+    api.plugin_config['list_option'] = ['a', 'b', 'c']
+
+    # Read values, will return the registered default if not set
+    text = api.plugin_config['text_option']
+    enabled = api.plugin_config['bool_option']
+    count = api.plugin_config['int_option']
+    items = api.plugin_config['list_option']
+
+    # Read with explicit defaults
+    text = api.plugin_config.get('text_option', 'default')
+    enabled = api.plugin_config.get('bool_option', False)
+    count = api.plugin_config.get('int_option', 0)
+    items = api.plugin_config.get('list_option', [])
+
+    # Check if key exists
+    if 'my_option' in api.plugin_config:
+        value = api.plugin_config['my_option']
+
+    # Remove a key
+    api.plugin_config.remove('old_option')
+```
+
+**In OptionsPage:**
+```python
+from picard.plugin3.api import PluginApi, OptionsPage
+
+
+class MyOptionsPage(OptionsPage):
+    def __init__(self):
+        super().__init__()
+        # Initialize the UI here
+
+    def load(self):
+        # Load from plugin config
+        enabled = self.api.plugin_config.get('enabled', True)
+        self.checkbox.setChecked(enabled)
+
+    def save(self):
+        # Save to plugin config
+        self.api.plugin_config['enabled'] = self.checkbox.isChecked()
+```
+
+**Benefits**:
+- Isolated from other plugins
+- Automatically namespaced under `plugin.{uuid}`
+- Persisted in Picard config
+- Supports any JSON-serializable type
+
+**Note**: Values are stored in Qt settings format. Complex types (lists, dicts) are automatically serialized.
+
+#### Profile support
+
+Plugin options can participate in Picard's user profiles system. When an option is profile-eligible, users can override its value per-profile from the Profiles options page.
+
+To make an option profile-eligible, pass `title` and `in_profile=True` to `register_option`:
+
+```python
+def enable(api):
+    api.plugin_config.register_option(
+        'greeting',
+        'Hello World',
+        title='Greeting message',
+        in_profile=True,
+    )
+```
+
+- `title`: Human-readable name displayed in the Profiles options page.
+- `in_profile=True`: Opts the option into the profile override system.
+
+When a profile is active and overrides the option, reads from `api.plugin_config['greeting']` automatically return the profile value. Writes go to the profile's storage. The base (non-profile) value is preserved.
+
+**Two things are required for the option to appear in the Profiles editor:**
+
+1. Register it with `in_profile=True` and a `title` (as above).
+2. Surface it through an `OptionsPage` that lists it in its `OPTIONS` dict and
+   is registered with `api.register_options_page(...)`.
+
+Registering the option alone is not enough: an option is only added to the
+profile groups (the "Settings to include in profile" tree on the Option
+Profiles page) when a registered options page declares it. If your plugin
+registers a profile-eligible option but never exposes it on a registered
+options page, it will not show up in the profiles editor.
+
+```python
+from typing import ClassVar
+
+from picard.plugin3.api import OptionsPage, PageOptionConfigs
+
+
+class MyOptionsPage(OptionsPage):
+    NAME = 'my_plugin'
+    TITLE = 'My Plugin'
+    PARENT = 'plugins'
+    OPTIONS: ClassVar[PageOptionConfigs] = {
+        'greeting': {'widgets': ['greeting_input']},
+    }
+
+    def load(self):
+        self.greeting_input.setText(self.api.plugin_config['greeting'])
+
+    def save(self):
+        self.api.plugin_config['greeting'] = self.greeting_input.text()
+
+
+def enable(api):
+    api.plugin_config.register_option(
+        'greeting',
+        'Hello World',
+        title='Greeting message',
+        in_profile=True,
+    )
+    api.register_options_page(MyOptionsPage)
+```
+
+#### Numeric bounds
+
+Numeric options (int or float defaults) can declare a valid range with
+`bounds=(minimum, maximum)`. A value read from the configuration that falls
+outside the range is clamped to the nearest bound, and a warning is logged.
+Either element may be `None` to leave that side unbounded.
+
+```python
+def enable(api):
+    # Threads must be at least 1, at most 8
+    api.plugin_config.register_option('threads', 4, bounds=(1, 8))
+
+    # A ratio in the range 0.0..1.0
+    api.plugin_config.register_option('ratio', 0.5, bounds=(0.0, 1.0))
+
+    # Only a lower bound; no upper limit
+    api.plugin_config.register_option('retries', 3, bounds=(0, None))
+```
+
+- `bounds` is only valid for int or float options; passing it for any other
+  type raises `TypeError`.
+- `int` options require `int` bounds; `float` options accept `int` or `float`
+  bounds (coerced to `float`). `bool` bounds are rejected.
+- Declaring `minimum` greater than `maximum` raises `ValueError`.
+
+Clamping happens on read, so an out-of-range value stored by an older version
+of the plugin (or a hand-edited config) is corrected automatically the next
+time the option is read.
+
+**Options page with profile highlighting:**
+
+Declare widgets in the page's `OPTIONS` dict to enable visual highlighting when a profile overrides the option:
+
+```python
+from typing import ClassVar
+from picard.plugin3.api import OptionsPage, PageOptionConfigs
+
+
+class MyOptionsPage(OptionsPage):
+    OPTIONS: ClassVar[PageOptionConfigs] = {
+        'greeting': {'widgets': ['greeting_input']},
+    }
+```
+
+The widget will be highlighted in the options dialog when the option is tracked or overridden by an active profile.
+
+Each key in `OPTIONS` is an option name; its `'widgets'` entry is a list of the
+widget attribute names on the page that edit that option. A widget name is
+resolved on the `OptionsPage` subclass instance, either via a loaded Qt Designer
+UI object (`self.ui.<name>`) or directly on the page (`self.<name>`). Listing
+more than one widget highlights all of them for the same option.
+
+**Note:** Highlighting only works when the widget is reachable from the
+`OptionsPage` subclass as `self.ui.<name>` or `self.<name>`. The example above
+highlights `self.ui.greeting_input` or `self.greeting_input`.
+
+**Behavior summary:**
+
+| Plugin state | Profile editor | Profile overrides applied |
+|---|---|---|
+| Enabled | Option visible for selection | Yes |
+| Disabled | Option hidden | No (data retained) |
+| Re-enabled | Option visible, prior data restored | Yes |
+| Uninstalled (config kept) | Option hidden | No (data retained) |
+| Uninstalled (config deleted) | Option removed from all profiles | No |
+
+---
+
+### `plugin_persist: ConfigSection`
+
+Volatile per-machine storage private to the plugin.
+
+Use this for data that is specific to the current machine and can be safely
+discarded without data loss. Unlike `plugin_config` (which stores user settings
+and participates in profiles), `plugin_persist` is for transient state that
+should not be synced between machines.
+
+**Examples:** window positions, dialog geometry, last-used directory paths,
+dismissed warnings, UI state.
+
+```python
+def enable(api):
+    # Register options with defaults
+    api.plugin_persist.register_option('last_directory', '')
+    api.plugin_persist.register_option('dialog_dismissed', False)
+
+    # Write values
+    api.plugin_persist['last_directory'] = '/home/user/music'
+    api.plugin_persist['dialog_dismissed'] = True
+
+    # Read values
+    last_dir = api.plugin_persist['last_directory']
+    dismissed = api.plugin_persist['dialog_dismissed']
+
+    # Check and remove
+    if 'last_directory' in api.plugin_persist:
+        api.plugin_persist.remove('last_directory')
+```
+
+**Key differences from `plugin_config`:**
+- No profile support — values are never overridden by user profiles
+- Data may be cleared during major version upgrades
+- Stored under `plugin_persist.{uuid}` (separate from plugin settings)
+
+---
+
+### `plugin_dir: Path`
+
+Path to the plugin directory (read-only).
+
+```python
+from pathlib import Path
+import json
+
+
+def enable(api):
+    # Access plugin directory
+    plugin_dir = api.plugin_dir
+
+    # Load data files
+    data_file = plugin_dir / 'data' / 'config.json'
+    with open(data_file) as f:
+        config = json.load(f)
+
+    # Load text files
+    readme = plugin_dir / 'README.md'
+    if readme.exists():
+        with open(readme) as f:
+            content = f.read()
+
+    # List files in directory
+    for file in (plugin_dir / 'templates').glob('*.txt'):
+        api.logger.info(f"Found template: {file.name}")
+```
+
+**Use cases**:
+- Load configuration files
+- Read data files (JSON, CSV, etc.)
+- Access templates or resources
+- Load UI files (.ui)
+
+**Returns**: `Path` object or `None` if plugin directory is not available
+
+**Important**: This is for **reading** files only. Do not write to the plugin directory:
+- Use `api.plugin_config` for storing plugin settings
+- Use standard user directories for cache/data files
+
+---
+
+### `web_service: WebService`
+
+Access to Picard's web service for HTTP requests.
+
+```python
+def my_processor(api, album, metadata, release):
+    def response_handler(response, reply, error):
+        if error:
+            api.logger.error(f"Request failed: {error}")
+        else:
+            data = response.json()
+            # Process data
+
+    api.web_service.get(
+        'example.com',
+        '/api/endpoint',
+        response_handler,
+        priority=True,
+        important=False,
+    )
+```
+
+---
+
+### `mb_api: MBAPIHelper`
+
+Helper for MusicBrainz API requests.
+
+```python
+def my_processor(api, album, metadata, release):
+    # Simplified MusicBrainz API access
+    api.mb_api.get_release_by_id(
+        release_id,
+        handler,
+        inc=['artists', 'recordings'],
+    )
+```
+
+---
+
+## Translation Methods
+
+### `get_locale() -> str`
+
+Get the current locale used by Picard.
+
+```python
+def enable(api):
+    locale = api.get_locale()  # e.g., 'en_US', 'de_DE', 'pt_BR'
+    api.logger.info(f"Current locale: {locale}")
+```
+
+---
+
+### `tr(key, text=None, **kwargs) -> str`
+
+Translate a string for the plugin.
+
+```python
+def enable(api):
+    # With fallback text
+    greeting = api.tr('greeting', 'Hello')
+
+    # With placeholders
+    message = api.tr('welcome', 'Welcome {name}', name='User')
+
+    # Key only (returns key if no translation)
+    label = api.tr('submit_button')
+```
+
+**See**: [TRANSLATIONS.md](TRANSLATIONS.md) for complete translation system documentation.
+
+---
+
+### `get_plugin_version() -> str`
+
+Get the plugin's own version as displayed in CLI and GUI.
+
+```python
+def enable(api):
+    version = api.get_plugin_version()
+    api.logger.info(f"Running version: {version}")
+
+    # Examples of returned formats:
+    # "v1.2.3 @abc1234" - version tag with commit
+    # "@abc1234" - commit only (no version tag)
+    # "1.0.0" - manifest version (no git metadata)
+    # "Unknown" - no version information available
+```
+
+**Returns**: Version string in format "ref @commit", "@commit", manifest version, or "Unknown"
+
+**Use cases**:
+- Logging current plugin version
+- Version-specific behavior
+- Debugging and support
+
+---
+
+### `trn(key, singular=None, plural=None, n=0, **kwargs) -> str`
+
+Translate a string with plural forms.
+
+```python
+def enable(api):
+    # Plural translation
+    count_msg = api.trn('files', '{n} file', '{n} files', n=5)
+    # Result: "5 files" (English) or "5 Dateien" (German)
+```
+
+**Parameters:**
+- `n`: Required parameter to determine the correct plural form
+- Use `{n}` in format strings (automatically available for substitution)
+
+**See**: [TRANSLATIONS.md](TRANSLATIONS.md) for plural forms and CLDR rules.
+
+---
+
+### `t_(key, text=None, plural=None)` (module-level function)
+
+Mark a string for translation extraction without translating it immediately.
+
+This is a marker function that allows you to define translatable strings at module level or in data structures before the API is available. At runtime, it simply returns the key (or tuple for plurals) unchanged.
+
+```python
+from picard.plugin3.api import PluginApi, BaseAction, t_
+
+# Define translatable strings at module level
+ERROR_MESSAGES = {
+    404: t_('error.not_found', 'Not found'),
+    500: t_('error.server', 'Server error'),
+}
+
+# Define plural forms
+FILE_COUNT = t_('files.count', '{n} file', '{n} files')
+
+
+# Use in class definitions
+class MyAction(BaseAction):
+    TITLE = "My Custom Action"
+
+    def __init__(self):
+        super().__init__()
+        self.setText(self.api.tr("action.name", "My Custom Action"))
+
+
+def enable(api):
+    # Translate at runtime
+    error_msg = api.tr(ERROR_MESSAGES[404], 'Not found')
+
+    # Use plural forms (unpacks to key, singular, plural)
+    count_msg = api.trn(*FILE_COUNT, n=5)
+```
+
+**Parameters:**
+- `key`: Translation key
+- `text`: Default text (singular form) - used by extraction tool
+- `plural`: Plural form (optional) - used by extraction tool
+
+**Returns:**
+- If no plural: returns `key`
+- If plural: returns `(key, text, plural)` tuple
+
+**Benefits:**
+- Define translations once, use multiple times
+- No repetition of translation strings
+- Works at module/class level before `enable()` is called
+- Zero runtime overhead (just returns key/tuple)
+- Extractor finds and extracts all marked strings
+
+**See**: [TRANSLATIONS.md](TRANSLATIONS.md) for complete translation system documentation.
+
+---
+
+## Registration Methods
+
+### Metadata Processors
+
+#### `register_track_metadata_processor(function, priority=0)`
+
+Register a function to process track metadata.
+
+**Signature**: `function(api, track, metadata, track_node, release_node=None)`
+
+```python
+def process_track(api, track, metadata, track_node, release_node=None):
+    """Process track metadata."""
+    api.logger.info(f"Processing: {metadata['title']}")
+    metadata['custom_tag'] = 'value'
+
+
+def enable(api):
+    api.register_track_metadata_processor(process_track)
+    # With priority
+    api.register_track_metadata_processor(process_track, priority=100)
+```
+
+**Parameters**:
+- `function`: Processor function (receives `api`, `track`, `metadata`, `track_node`, `release_node`)
+- `priority`: Execution priority (higher = earlier, default: 0)
+
+---
+
+#### `register_album_metadata_processor(function, priority=0)`
+
+Register a function to process album metadata.
+
+**Signature**: `function(api, album, metadata, release_node)`
+
+```python
+def process_album(api, album, metadata, release_node):
+    """Process album metadata."""
+    metadata['custom_album_tag'] = 'value'
+
+
+def enable(api):
+    api.register_album_metadata_processor(process_album)
+```
+
+---
+
+### Event Hooks
+
+#### `register_file_post_load_processor(function, priority=0)`
+
+Called after a file is loaded.
+
+**Signature**: `function(api, file)`
+
+```python
+def on_file_loaded(api, file):
+    api.logger.info(f"File loaded: {file.filename}")
+
+
+def enable(api):
+    api.register_file_post_load_processor(on_file_loaded)
+```
+
+---
+
+#### `register_file_pre_save_processor(function, priority=0)`
+
+Called just before a file is saved.
+
+**Signature**: `function(api, file)`
+
+```python
+def on_file_saved(api, file):
+    api.logger.info(f"File saved: {file.filename}")
+
+
+def enable(api):
+    api.register_file_pre_save_processor(on_file_saved)
+```
+
+---
+
+#### `register_file_post_save_processor(function, priority=0)`
+
+Called after a file is saved.
+
+**Signature**: `function(api, file)`
+
+```python
+def on_file_saved(api, file):
+    api.logger.info(f"File saved: {file.filename}")
+
+
+def enable(api):
+    api.register_file_post_save_processor(on_file_saved)
+```
+
+---
+
+#### `register_file_post_addition_to_track_processor(function, priority=0)`
+
+Called when a file is added to a track.
+
+**Signature**: `function(api, track, file)`
+
+---W
+
+#### `register_file_post_removal_from_track_processor(function, priority=0)`
+
+Called when a file is removed from a track.
+
+**Signature**: `function(api, track, file)`
+
+---
+
+#### `register_album_post_removal_processor(function, priority=0)`
+
+Called when an album is removed.
+
+**Signature**: `function(api, album)`
+
+---
+
+### Script Functions
+
+#### `register_script_function(function, name=None, eval_args=True, check_argcount=True, documentation=None)`
+
+Register a custom tagger script function.
+
+```python
+def my_script_func(parser, arg1, arg2):
+    """Custom script function."""
+    return f"{arg1}-{arg2}"
+
+
+def enable(api):
+    api.register_script_function(
+        my_script_func,
+        name="my_func",  # Optional: defaults to function name
+        documentation="Combines two arguments with a dash",
+        signature="$my_func(arg1,arg2)",
+    )
+```
+
+**Usage in scripts**: `$my_func(value1,value2)`
+
+**Parameters**:
+- `function`: Function to register (first arg is always `parser`)
+- `name`: Function name in scripts (default: function's `__name__`)
+- `eval_args`: Whether to evaluate arguments (default: True)
+- `check_argcount`: Whether to check argument count (default: True)
+- `documentation`: Help text for the function
+
+---
+
+#### `register_script_variable(name, documentation=None, title=None, is_multi_value=False, is_from_mb=False)`
+
+Register a variable name for script autocomplete and tag dropdowns.
+
+Registered variables become available in:
+- The script editor autocomplete (`%variable_name%`)
+- The edit tag dialog dropdown (for non-hidden variables)
+- The tag list editor in options pages (for non-hidden variables)
+- The scripting documentation panel
+
+Re-registering a name with the same hidden status replaces the existing entry,
+so plugins can re-register safely without unregistering first. Re-registering
+with a *different* hidden status is rejected (see **Raises**).
+
+```python
+def enable(api):
+    # Regular variable — appears in tag dropdowns and scripts
+    api.register_script_variable(
+        "my_plugin_var",
+        documentation="A custom variable from my plugin",
+        title="My Variable",
+    )
+
+    # Hidden variable — in scripts, autocomplete and docs, but not tag dropdowns
+    api.register_script_variable(
+        "_my_hidden_var",
+        documentation="A computed value for use in scripts",
+    )
+
+    # Multi-value variable
+    api.register_script_variable(
+        "my_list_var",
+        documentation="A variable that can hold multiple values",
+        is_multi_value=True,
+    )
+```
+
+**Parameters**:
+- `name`: The variable name as it appears between `%` symbols in scripts. A
+  leading `_` marks the variable as hidden: it still appears in script
+  autocomplete and the scripting documentation, but not in the tag dropdowns
+  and tag list editor. A base name is either hidden or visible, not both.
+- `documentation`: Optional help text shown in the scripting documentation panel.
+- `title`: Optional display title for the metadata box (e.g., "Caller"). If
+  provided, the tag shows this human-readable title instead of the raw name in
+  the UI.
+- `is_multi_value`: Whether this variable can hold multiple values
+  (default: `False`).
+- `is_from_mb`: Whether the tag information is provided from the MusicBrainz
+  database (default: `False`).
+
+**Raises**: `ValueError` if:
+- The variable name is invalid (must use only letters, digits, underscores).
+- The same base name is already registered with a different hidden status
+  (e.g., registering `_foo` when `foo` is already registered, or vice versa).
+
+---
+
+#### `unregister_script_variable(name)`
+
+Unregister a single script variable previously registered by this plugin. The
+spelling must match the variable's hidden status, as for `register_script_variable`.
+
+```python
+def enable(api):
+    api.register_script_variable("my_var", "My variable")
+    api.register_script_variable("_my_hidden_var", "My hidden variable")
+    # Later, when the variables are no longer needed:
+    api.unregister_script_variable("my_var")  # visible -> no prefix
+    api.unregister_script_variable("_my_hidden_var")  # hidden  -> prefix
+```
+
+**Parameters**:
+- `name`: The variable name to unregister. Prefix with `_` if (and only if)
+  the variable is hidden.
+
+**Raises**: `ValueError` if a variable with the given base name is registered
+but its hidden status does not match the spelling (prefix present/absent).
+Unregistering a name that is not registered is a no-op.
+
+**Note**: Only removes the variable registered by this plugin. If another plugin
+has registered the same variable name, that registration is unaffected.
+
+---
+
+#### `unregister_all_script_variables()`
+
+Unregister all script variables registered by this plugin.
+
+This is useful when a plugin needs to re-register variables that depend on
+configuration. Call this before re-registering to avoid stale entries from a
+previous configuration.
+
+```python
+def on_config_changed(api):
+    # Remove all previously registered variables
+    api.unregister_all_script_variables()
+    # Re-register based on current config
+    for var_name, description in get_configured_variables():
+        api.register_script_variable(var_name, description)
+```
+
+**Note**: Only removes variables registered by this plugin. Other plugins'
+registrations are unaffected.
+
+---
+
+### UI Actions
+
+Plugins can register actions for context menus of albums, tracks, files, clusters, and cluster lists, as well as the Plugin Tools menu.
+
+Context menu actions:
+
+- `register_album_action(action)`
+- `register_track_action(action)`
+- `register_file_action(action)`
+- `register_cluster_action(action)`
+- `register_clusterlist_action(action)`
+
+Plugin Tools menu actions:
+
+- `register_tools_menu_action(action)`
+
+#### Register menu actions for different object types
+
+```python
+from picard.plugin3.api import BaseAction
+
+
+class MyAction(BaseAction):
+    TITLE = "My Custom Action"
+
+    def callback(self, objs):
+        for obj in objs:
+            self.api.logger.info(f"Action on: {obj}")
+
+
+def enable(api):
+    # Context menus
+    api.register_file_action(MyAction)
+    api.register_track_action(MyAction)
+    api.register_album_action(MyAction)
+    api.register_cluster_action(MyAction)
+    api.register_clusterlist_action(MyAction)
+
+    # Plugin Tools menu
+    api.register_tools_menu_action(MyAction)
+```
+
+**Note**: Pass the class, not an instance. Picard makes `self.api` available inside
+the class to access the `PluginApi` instance of the plugin.
+
+#### Place actions in submenus
+
+Plugin actions can be placed in submenus by setting the `MENU` attribute of the action class.
+The `MENU` attribute is a tuple of parent menu names.
+
+Example:
+
+```python
+from picard.plugin3.api import BaseAction
+
+
+class MyAction1(BaseAction):
+    TITLE = "Action 1"
+    MENU = ("My Plugin",)
+
+    def callback(self, objs): ...
+
+
+class MyAction2(BaseAction):
+    TITLE = "Action 2"
+    MENU = ("My Plugin",)
+
+    def callback(self, objs): ...
+
+
+class MyAction3(BaseAction):
+    TITLE = "Action 3"
+    MENU = ("My Plugin", "Submenu")
+
+    def callback(self, objs): ...
+
+
+class MyAction4(BaseAction):
+    TITLE = "Action 4"
+    MENU = ("My Plugin", "Submenu")
+
+    def callback(self, objs): ...
+
+
+def enable(api):
+    api.register_tools_menu_action(MyAction1)
+    api.register_tools_menu_action(MyAction2)
+    api.register_tools_menu_action(MyAction3)
+    api.register_tools_menu_action(MyAction4)
+```
+
+The above example will create a "My Plugin" submenu in the Tools menu with four actions
+arranged like:
+
+- My Plugin
+  - Action 1
+  - Action 2
+  - Submenu
+    - Action 3
+    - Action 4
+
+---
+
+### Metadata Tag Actions
+
+#### `register_metadata_tag_action(action)`
+
+Register a context menu action for metadata tags. The action appears when right-clicking
+tags in the metadata view and works with both single and multi-tag selections.
+
+```python
+from picard.plugin3.api import MetadataTagAction, t_
+
+
+class PinTagAction(MetadataTagAction):
+    TITLE = t_("action.pin_tag", "Pin Tag")
+
+    def callback(self, tags, objects):
+        for tag in tags:
+            self.api.logger.info(f"Pinning tag: {tag}")
+            for obj in objects:
+                pinned = obj.metadata.getall('pinned_tags')
+                if tag not in pinned:
+                    pinned.append(tag)
+                    obj.metadata['pinned_tags'] = pinned
+
+    def is_visible(self, tags, objects):
+        # Only show for non-internal tags
+        return all(not tag.startswith('~') for tag in tags)
+
+
+def enable(api):
+    api.register_metadata_tag_action(PinTagAction)
+```
+
+**Base class**: `MetadataTagAction` (inherits from `HasDisplayTitle`)
+
+**Required**:
+- `TITLE`: Menu item label. Use `t_()` for plugin translations.
+- `callback(self, tags, objects)`: Called when the action is triggered.
+  - `tags`: List of selected tag names (`list[str]`, always a list even for single selection)
+  - `objects`: Set of selected objects (files, tracks, albums)
+
+**Optional**:
+- `is_visible(self, tags, objects) -> bool`: Controls whether the action appears in the
+  context menu. Defaults to `True`. Receives the same `tags` and `objects` as `callback`.
+
+**Note**: Pass the class, not an instance. Picard makes `self.api` available inside
+the class.
+
+---
+
+### Options Pages
+
+#### `register_options_page(page_class)`
+
+Register a settings page in Picard's options dialog.
+
+```python
+from picard.plugin3.api import OptionsPage
+
+
+class MyOptionsPage(OptionsPage):
+    NAME = "my_plugin"
+    TITLE = "My Plugin"
+    PARENT = "plugins"
+
+    def __init__(self):
+        super().__init__()
+        # Build UI
+
+    def load(self):
+        # Load settings from self.api.plugin_config or self.api.global_config
+        pass
+
+    def save(self):
+        # Save settings to self.api.plugin_config or self.api.global_config
+        pass
+
+
+def enable(api):
+    api.register_options_page(MyOptionsPage)
+```
+
+**Required attributes**:
+- `NAME`: Unique identifier
+- `TITLE`: Display name
+- `PARENT`: Parent page (usually "plugins")
+
+**Required methods**:
+- `load()`: Load settings into UI
+- `save()`: Save settings from UI
+
+---
+
+### Cover Art Providers
+
+#### `register_cover_art_provider(provider)`
+
+Register a custom cover art provider.
+
+```python
+from picard.plugin3.api import CoverArtProvider
+
+
+class MyProvider(CoverArtProvider):
+    NAME = "My Provider"
+
+    def queue_images(self):
+        # Queue cover art images
+        pass
+
+
+def enable(api):
+    api.register_cover_art_provider(MyProvider)
+```
+
+---
+
+#### `register_cover_art_filter(filter)`
+
+Register a filter to process cover art images.
+
+```python
+def my_cover_filter(api, metadata, image):
+    """Filter cover art images."""
+    # Return True to keep, False to discard
+    return image.width >= 500
+
+
+def enable(api):
+    api.register_cover_art_filter(my_cover_filter)
+```
+
+**Signature**: `function(api, metadata, image) -> bool`
+
+---
+
+#### `register_cover_art_metadata_filter(filter)`
+
+Register a filter to process cover art metadata.
+
+```python
+def my_metadata_filter(api, metadata, image_metadata):
+    """Filter cover art by metadata."""
+    return image_metadata.get('type') == 'front'
+
+
+def enable(api):
+    api.register_cover_art_metadata_filter(my_metadata_filter)
+```
+
+**Signature**: `function(api, metadata, image_metadata) -> bool`
+
+---
+
+#### `register_cover_art_processor(processor_class)`
+
+Register a processor to modify cover art images.
+
+```python
+class MyProcessor:
+    def save_to_tags(self):
+        return True
+
+    def save_to_file(self):
+        return True
+
+    def same_processing(self):
+        return True
+
+    def run(self, image):
+        # Modify image
+        return image
+
+
+def enable(api):
+    api.register_cover_art_processor(MyProcessor)
+```
+
+---
+
+### File Formats
+
+#### `register_format(format)`
+
+Register support for a custom file format.
+
+```python
+from picard.plugin3.api import File
+
+
+class MyFormat(File):
+    EXTENSIONS = [".myformat"]
+    NAME = "My Format"
+
+    def _load(self, filename):
+        # Load file
+        pass
+
+    def _save(self, filename):
+        # Save file
+        pass
+
+
+def enable(api):
+    api.register_format(MyFormat)
+```
+
+---
+
+### Disc Log Readers
+
+#### `register_disc_log_reader(function)`
+
+Register a custom CD ripping log parser for the *Lookup CD log file* feature.
+
+When a user opens a log file, all registered readers are tried in sequence until
+one succeeds. The function should raise any exception if it cannot parse the file
+(e.g., wrong format); Picard will catch the exception and try the next reader.
+
+**Signature**: `function(path: str) -> TocNumbers`
+
+The returned `TocNumbers` (a `tuple[int, ...]`) must be a MusicBrainz TOC:
+`(first_track, last_track, leadout_offset, offset_1, offset_2, ...)`
+
+```python
+import re
+
+from picard.disc.utils import (
+    TocEntry,
+    calculate_mb_toc_numbers,
+    NotSupportedTOCError,
+)
+
+
+def my_ripper_toc_from_file(api, path):
+    """Parse MyRipper log files for disc ID lookup."""
+    entries = []
+    with open(path, encoding='utf-8') as f:
+        first_line = f.readline()
+        if not first_line.startswith('MyRipper'):
+            raise NotSupportedTOCError("Not a MyRipper log")
+        for line in f:
+            m = re.match(r"Track (\d+): (\d+)-(\d+)", line)
+            if m:
+                entries.append(TocEntry(int(m[1]), int(m[2]), int(m[3])))
+    return calculate_mb_toc_numbers(entries)
+
+
+def enable(api):
+    api.register_disc_log_reader(my_ripper_toc_from_file)
+```
+
+**Parameters**:
+- `function`: A callable taking a file path (`str`) and returning `TocNumbers`
+  (from `picard.disc.utils`). Should raise an exception (e.g.,
+  `NotSupportedTOCError`) if it cannot parse the file.
+
+**Tips**:
+- Validate the file format early (e.g., check a header line) so that
+  unrecognized files fail fast without reading the entire file.
+- Use `picard.disc.utils.TocEntry` and `calculate_mb_toc_numbers()` to build
+  the TOC from track start/end sectors.
+- Built-in readers support EAC, XLD, fre:ac, Whipper, Cyanrip, dBpoweramp,
+  and SCSI TOC formats. Plugin readers are tried after all built-in readers.
+
+---
+
+## Album Background Task Management
+
+Plugins can track asynchronous operations (like web requests) without blocking album loading.
+
+### `add_album_task(album, task_id, description, timeout=None, request_factory=None, blocking=False)`
+
+Add a plugin task to an album. Plugin tasks default to non-blocking and won't prevent the album from being marked as loaded. This behavior can be changed by setting the `blocking` parameter to True.
+
+**Parameters**:
+- `album`: The Album object
+- `task_id`: Unique identifier (automatically prefixed with plugin_id)
+- `description`: Human-readable description
+- `timeout`: Optional timeout in seconds. When `blocking=True`, capped at 30 seconds maximum (defaults to 30s if not specified) to prevent UI freezing during album loading. When `blocking=False`, no plugin-level cap is applied. Note that all timeouts are ultimately capped by the user-configurable network_transfer_timeout_seconds setting (default 30s).
+- `request_factory`: Callable that creates and returns a PendingRequest. Use this to register network requests for automatic cancellation when the album is removed.
+- `blocking`: If set to True, the album will not be marked as loaded until this task is completed. Use with caution as this blocks album loading. Always specify a reasonable timeout when using blocking=True.
+
+**Example - Fetching additional album data**:
+```python
+from functools import partial
+
+
+def fetch_album_data(api, album, metadata, release):
+    artist_id = metadata.get('musicbrainz_artistid')
+    if not artist_id:
+        return
+
+    task_id = f'bio_{album.id}'
+
+    def create_request():
+        return api.web_service.get_url(
+            url=f'https://api.example.com/artist/{artist_id}',
+            handler=partial(handle_response, api, album, metadata, task_id),
+        )
+
+    api.add_album_task(
+        album,
+        task_id,
+        f'Fetching artist bio for {artist_id}',
+        request_factory=create_request,
+    )
+
+
+def handle_response(api, album, metadata, task_id, data, error):
+    try:
+        if not error and data:
+            metadata['~artist_bio'] = data.get('biography', '')
+    finally:
+        api.complete_album_task(album, task_id)
+
+
+def enable(api):
+    api.register_album_metadata_processor(fetch_album_data)
+```
+
+**Note**: If your task doesn't involve a network request, you can omit `request_factory`. However, if you're making a web request, you should always provide `request_factory` to ensure the request is properly cancelled if the album is removed.
+
+---
+
+### `complete_album_task(album, task_id)`
+
+Mark a plugin task as complete.
+
+**Parameters**:
+- `album`: The Album object
+- `task_id`: Same ID used in add_album_task (without plugin prefix)
+
+**Example - Fetching cover art from external source**:
+```python
+def fetch_custom_cover(api, album, metadata, release):
+    album_id = metadata.get('musicbrainz_albumid')
+    if not album_id:
+        return
+
+    task_id = f'cover_{album_id}'
+    api.add_album_task(album, task_id, 'Fetching custom cover art', timeout=10.0)
+
+    request = api.web_service.download_url(
+        url=f'https://covers.example.com/{album_id}.jpg',
+        handler=lambda data, http, error: handle_cover(api, album, task_id, data, error),
+    )
+    api.set_album_task_request(album, task_id, request)
+
+
+def handle_cover(api, album, task_id, data, error):
+    try:
+        if not error and data:
+            # Process cover art data
+            api.logger.info(f"Downloaded cover art: {len(data)} bytes")
+    finally:
+        api.complete_album_task(album, task_id)
+
+
+def enable(api):
+    api.register_album_metadata_processor(fetch_custom_cover)
+```
+
+**Important**: Always call `complete_album_task()` in a `finally` block to ensure the task is marked complete even if an error occurs.
+
+---
+
+## API Parameter Injection
+
+### How It Works
+
+Picard uses `functools.partial` to automatically inject the `api` parameter:
+
+**For Processors**:
+```python
+def my_processor(api, track, metadata, track_node, release=None):
+    # api is automatically injected as first parameter
+    api.logger.info("Processing")
+
+
+def enable(api):
+    # Picard wraps this as: partial(my_processor, api)
+    api.register_track_metadata_processor(my_processor)
+```
+
+**For Classes**:
+```python
+from picard.plugin3.api import OptionsPage
+
+
+class MyPage(OptionsPage):
+    def load(self):
+        self.api.logger.info("Loading")
+
+
+def enable(api):
+    api.register_options_page(MyPage)
+```
+
+---
+
+## Priority System
+
+Many registration methods accept a `priority` parameter:
+
+- **Higher priority** = executed earlier
+- **Default**: 0
+- **Range**: Typically -100 to 100
+
+```python
+def enable(api):
+    # Run first
+    api.register_track_metadata_processor(important_processor, priority=100)
+
+    # Run normally
+    api.register_track_metadata_processor(normal_processor)
+
+    # Run last
+    api.register_track_metadata_processor(cleanup_processor, priority=-100)
+```
+
+The priority determines in which order the registered functions of the same type
+run. Note that the user can override the registered priority and change the execution
+order of plugins.
+
+**Use cases**:
+- High priority: Data fetching, critical preprocessing
+- Normal priority: Most processors
+- Low priority: Cleanup, formatting, final touches
+
+---
+
+## Complete Example
+
+```python
+from PyQt6.QtWidgets import QCheckBox
+from picard.plugin3.api import PluginApi, BaseAction, OptionsPage, t_
+
+
+class MyOptionsPage(OptionsPage):
+    NAME = "example"
+    TITLE = t_("Example Plugin")
+    PARENT = "plugins"
+
+    def __init__(self):
+        super().__init__()
+        self.checkbox = QCheckBox("Enable processing")
+        self.layout().addWidget(self.checkbox)
+
+    def load(self):
+        enabled = self.api.global_config.setting.get('example_enabled', False)
+        self.checkbox.setChecked(enabled)
+
+    def save(self):
+        self.api.global_config.setting['example_enabled'] = self.checkbox.isChecked()
+
+
+def process_track(api, track, metadata, track_node, release=None):
+    """Process track metadata."""
+    if api.global_config.setting.get('example_enabled', False):
+        api.logger.info(f"Processing: {metadata.get('title', 'Unknown')}")
+        metadata['example_tag'] = 'processed'
+
+
+def on_file_saved(api, file):
+    """Called after file is saved."""
+    api.logger.info(f"Saved: {file.filename}")
+
+
+class MyAction(BaseAction):
+    TITLE = t_("Example Action")
+
+    def callback(self, objs):
+        self.api.logger.info(f"Action on {len(objs)} objects")
+
+
+def enable(api):
+    """Plugin entry point."""
+    api.logger.info("Example plugin loaded")
+
+    # Register processors
+    api.register_track_metadata_processor(process_track)
+    api.register_file_post_save_processor(on_file_saved)
+
+    # Register UI
+    api.register_options_page(MyOptionsPage)
+    api.register_file_action(MyAction)
+```
+
+---
+
+## Best Practices
+
+1. **Always use the api parameter**: Don't import Picard internals directly
+2. **Use plugin_config for plugin settings**: Keeps your config isolated
+3. **Log appropriately**: Use `debug` for verbose, `info` for important events.
+   Debug log entries are useful when a user is trying to understand which plugin
+   is making changes to metadata and such, but extensive debug logging such as
+   that required for troubleshooting a specific plugin can be overwhelming. If
+   detailed debug logging is included, it should be used with the
+   `api.logger.debug_if()` method so that it is only logged when the
+   `plugin_development` debug option is specified on the command line. For example:
+   ```python
+   # Single message
+   self.api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT, "Detailed debug message with no parameters")
+   self.api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT, "Resize: %d x %d", width, height)
+
+   # Lazy formatting with msg_func
+   self.api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT, msg_func=lambda: "Settings: %s" % expensive())
+
+   # Block guard to skip expensive code entirely when disabled
+   if dbg := self.api.logger.debug_if(DebugOpt.PLUGIN_DEVELOPMENT):
+       for item in items:
+           dbg("item: %r", item)
+   ```
+4. **Handle errors gracefully**: Wrap risky operations in try/except
+5. **Set priorities wisely**: Only use non-zero priorities when order matters
+6. **Pass api to parent classes**: You can use `self.api` in classes inherited from
+   base classes meant to be subclassed and imported from `picard.plugin3.api`,
+   like `BaseAction` or `OptionsPage`.
+
+---
+
+## See Also
+
+- [Migration Guide](MIGRATION.md) - Migrating from V2 to V3
+- [MANIFEST.toml](MANIFEST.md) - Plugin manifest format
+- [Translations](TRANSLATIONS.md) - Internationalization
