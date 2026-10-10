@@ -1,0 +1,338 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2025 Khoa Nguyen
+# Copyright (C) 2025-2026 Philipp Wolfer
+# Copyright (C) 2026 Bryan Roessler
+# Copyright (C) 2026 Laurent Monin
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+from collections.abc import (
+    Iterable,
+    Iterator,
+)
+from dataclasses import dataclass
+
+from PyQt6 import QtWidgets
+
+from picard.config import (
+    Option,
+    get_config,
+)
+from picard.i18n import setup_i18n
+
+import pytest
+
+from picard.ui.coverartbox import CoverArtBox
+
+
+@pytest.fixture(autouse=True)
+def i18n_c_locale() -> None:
+    # Ensure deterministic number formatting
+    setup_i18n(None, 'C')
+
+
+@dataclass
+class DummyImage:
+    types_text: str
+    datalength: int
+    width: int | None = None
+    height: int | None = None
+    mimetype: str | None = None
+
+    def types_as_string(self) -> str:
+        return self.types_text
+
+
+def lines_to_text(lines: Iterable[str]) -> str:
+    return "\n".join(lines)
+
+
+class _DummyThumb:
+    def __init__(self) -> None:
+        self.data: list[object] | None = None
+        self.related_images: list[DummyImage] = []
+        self.current_pixmap_key: int | None = None
+        self._visible: bool = True
+        self._tooltip: str = ""
+        self.marked_for_removal: bool = False
+
+    def setVisible(self, visible: bool) -> None:  # noqa: N802
+        self._visible = visible
+
+    def isVisible(self) -> bool:  # noqa: N802
+        return self._visible
+
+    def setToolTip(self, text: str) -> None:  # noqa: N802
+        self._tooltip = text
+
+    def toolTip(self) -> str:  # noqa: N802
+        return self._tooltip
+
+
+class _DummyLabel:
+    def __init__(self) -> None:
+        self._text: str = ""
+        self._visible: bool = True
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+    def setVisible(self, visible: bool) -> None:  # noqa: N802
+        self._visible = visible
+
+    def isVisible(self) -> bool:  # noqa: N802
+        return self._visible
+
+
+class _DummyButton:
+    def __init__(self) -> None:
+        self._visible: bool = False
+
+    def setVisible(self, visible: bool) -> None:  # noqa: N802
+        self._visible = visible
+
+    def isVisible(self) -> bool:  # noqa: N802
+        return self._visible
+
+
+class CoverArtBoxLite:
+    def __init__(self) -> None:
+        self.item = None
+        self._removal_predicted = False
+        self.cover_art_label = _DummyLabel()
+        self.cover_art_info_label = _DummyLabel()
+        self.orig_cover_art_label = _DummyLabel()
+        self.orig_cover_art_info_label = _DummyLabel()
+        self.show_details_button = _DummyButton()
+        self.cover_art = _DummyThumb()
+        self.orig_cover_art = _DummyThumb()
+        # Bind helpers from real implementation
+        self._first_image_info_lines = CoverArtBox._first_image_info_lines  # type: ignore[assignment]
+        self._format_info_text = CoverArtBox._format_info_text  # type: ignore[assignment]
+
+    def isHidden(self) -> bool:  # noqa: N802
+        return False
+
+    def update_display(self, force: bool = False) -> None:
+        CoverArtBox.update_display(self, force=force)
+
+
+@pytest.fixture
+def box() -> CoverArtBoxLite:
+    return CoverArtBoxLite()
+
+
+def test_option_default() -> None:
+    opt = Option.get('setting', "show_cover_art_details")
+    assert opt is not None
+    assert opt.default is False
+
+
+def test_options_page_load_and_save(patch_tagger_instance) -> None:
+    patch_tagger_instance('picard.ui.options')
+    from picard.ui.options.interface_cover_art_box import InterfaceCoverArtBoxOptionsPage
+
+    page = InterfaceCoverArtBoxOptionsPage()
+    page.load()
+    config = get_config()
+    # Default is False
+    assert config.setting['show_cover_art_details'] is False
+    assert page.ui.cb_show_cover_art_details.isChecked() is False
+
+    # Toggle on and save
+    page.ui.cb_show_cover_art_details.setChecked(True)
+    page.save()
+    assert config.setting['show_cover_art_details'] is True
+
+
+@pytest.mark.parametrize("show_details", [False, True])
+def test_coverartbox_label_toggle_and_tooltip_always_on(box: CoverArtBoxLite, show_details: bool) -> None:
+    # Configure option toggle
+    config = get_config()
+    config.setting['show_cover_art_details'] = show_details
+
+    # Provide one image on the new/current thumbnail
+    img = DummyImage("Front", 55300, 500, 500, "image/jpeg")
+    box.cover_art.related_images = [img]
+    box.orig_cover_art.related_images = []
+
+    box.update_display(force=True)
+
+    expected_lines = [
+        "Front",
+        "55.3 kB (54 KiB)",
+        "500 x 500",
+        "image/jpeg",
+    ]
+
+    # Label governed by `show_cover_art_details_type`, defaults to False
+    label_expected_lines = [
+        "55.3 kB (54 KiB)",
+        "500 x 500",
+        "image/jpeg",
+    ]
+
+    # Tooltip must always include details
+    assert box.cover_art.toolTip() == "<br/>".join(expected_lines)
+
+    # Label content depends on toggle
+    if show_details:
+        assert box.cover_art_info_label.text() == lines_to_text(label_expected_lines)
+    else:
+        assert box.cover_art_info_label.text() == ""
+
+
+# --- New tests for child options and UI wiring ---
+
+
+@pytest.fixture
+def _restore_cover_details_options() -> Iterator[None]:
+    """Restore details-related options after each test to avoid cross-test leakage."""
+    config = get_config()
+    keys = [
+        "show_cover_art_details",
+        "show_cover_art_details_type",
+        "show_cover_art_details_filesize",
+        "show_cover_art_details_dimensions",
+        "show_cover_art_details_mimetype",
+    ]
+    backup: dict[str, object] = {k: config.setting.get(k) for k in keys}
+    try:
+        yield
+    finally:
+        for k, v in backup.items():
+            config.setting[k] = v
+
+
+def test_child_option_defaults() -> None:
+    assert Option.get('setting', "show_cover_art_details_type").default is False
+    assert Option.get('setting', "show_cover_art_details_filesize").default is True
+    assert Option.get('setting', "show_cover_art_details_dimensions").default is True
+    assert Option.get('setting', "show_cover_art_details_mimetype").default is True
+
+
+def _set_details_config(
+    *,
+    parent: bool,
+    type_on: bool,
+    size_on: bool,
+    dims_on: bool,
+    mime_on: bool,
+) -> None:
+    config = get_config()
+    config.setting['show_cover_art_details'] = parent
+    config.setting['show_cover_art_details_type'] = type_on
+    config.setting['show_cover_art_details_filesize'] = size_on
+    config.setting['show_cover_art_details_dimensions'] = dims_on
+    config.setting['show_cover_art_details_mimetype'] = mime_on
+
+
+def test_options_page_children_enable_disable_and_save(
+    patch_tagger_instance,
+    _restore_cover_details_options: None,
+) -> None:
+    patch_tagger_instance('picard.ui.options')
+    from picard.ui.options.interface_cover_art_box import InterfaceCoverArtBoxOptionsPage
+
+    # Ensure parent starts unchecked for this test
+    get_config().setting['show_cover_art_details'] = False
+
+    page = InterfaceCoverArtBoxOptionsPage()
+    page.load()
+    # Initially parent unchecked, children should be disabled (greyed out)
+    assert page.ui.cb_show_cover_art_details.isChecked() is False
+    for child in (
+        page.ui.cb_show_cover_art_details_type,
+        page.ui.cb_show_cover_art_details_filesize,
+        page.ui.cb_show_cover_art_details_dimensions,
+        page.ui.cb_show_cover_art_details_mimetype,
+    ):
+        assert isinstance(child, QtWidgets.QCheckBox)
+        assert child.isEnabled() is False
+
+    # Toggle parent, children become enabled
+    page.ui.cb_show_cover_art_details.setChecked(True)
+    for child in (
+        page.ui.cb_show_cover_art_details_type,
+        page.ui.cb_show_cover_art_details_filesize,
+        page.ui.cb_show_cover_art_details_dimensions,
+        page.ui.cb_show_cover_art_details_mimetype,
+    ):
+        assert child.isEnabled() is True
+
+    # Change children and save
+    page.ui.cb_show_cover_art_details_type.setChecked(False)
+    page.ui.cb_show_cover_art_details_mimetype.setChecked(False)
+    page.save()
+
+    config = get_config()
+    assert config.setting['show_cover_art_details'] is True
+    assert config.setting['show_cover_art_details_type'] is False
+    assert config.setting['show_cover_art_details_filesize'] is True
+    assert config.setting['show_cover_art_details_dimensions'] is True
+    assert config.setting['show_cover_art_details_mimetype'] is False
+
+
+@pytest.mark.parametrize(
+    "type_on,size_on,dims_on,mime_on,expected",
+    [
+        (True, True, True, True, ["Front", "55.3 kB (54 KiB)", "500 x 500", "image/jpeg"]),
+        (False, True, True, True, ["55.3 kB (54 KiB)", "500 x 500", "image/jpeg"]),
+        (True, False, True, True, ["Front", "500 x 500", "image/jpeg"]),
+        (True, True, False, True, ["Front", "55.3 kB (54 KiB)", "image/jpeg"]),
+        (True, True, True, False, ["Front", "55.3 kB (54 KiB)", "500 x 500"]),
+        (False, False, False, False, []),
+    ],
+)
+def test_coverartbox_child_filtering(
+    box: CoverArtBoxLite,
+    _restore_cover_details_options: None,
+    type_on: bool,
+    size_on: bool,
+    dims_on: bool,
+    mime_on: bool,
+    expected: list[str],
+) -> None:
+    # Configure options
+    _set_details_config(parent=True, type_on=type_on, size_on=size_on, dims_on=dims_on, mime_on=mime_on)
+
+    # Provide one image on the new/current thumbnail
+    img = DummyImage("Front", 55300, 500, 500, "image/jpeg")
+    box.cover_art.related_images = [img]
+    box.orig_cover_art.related_images = []
+
+    # Update and assert
+    box.update_display(force=True)
+    assert box.cover_art_info_label.text() == lines_to_text(expected)
+    # Tooltip remains full
+    full = ["Front", "55.3 kB (54 KiB)", "500 x 500", "image/jpeg"]
+    assert box.cover_art.toolTip() == "<br/>".join(full)
+
+
+def test_coverartbox_missing_dimensions_mimetype(box: CoverArtBoxLite, _restore_cover_details_options: None) -> None:
+    # Enable all
+    _set_details_config(parent=True, type_on=True, size_on=True, dims_on=True, mime_on=True)
+    # Missing dims and mimetype
+    img = DummyImage("Front", 55300, None, None, None)
+    box.cover_art.related_images = [img]
+    box.orig_cover_art.related_images = []
+
+    box.update_display(force=True)
+    # Expected only type + size lines
+    assert box.cover_art_info_label.text() == lines_to_text(["Front", "55.3 kB (54 KiB)"])

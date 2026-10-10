@@ -1,0 +1,148 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2006 Lukáš Lalinský
+# Copyright (C) 2013, 2018, 2020-2021, 2023-2026 Laurent Monin
+# Copyright (C) 2013, 2020-2021, 2025-2026 Philipp Wolfer
+# Copyright (C) 2016-2017 Sambhav Kothari
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+from typing import ClassVar
+
+from picard.config import get_config
+from picard.const import CACHE_SIZE_DISPLAY_UNIT
+from picard.const.defaults import DEFAULT_CACHE_SIZE_IN_BYTES
+from picard.extension_points.options_pages import register_options_page
+from picard.i18n import (
+    N_,
+    gettext as _,
+)
+from picard.util import bytes2human
+
+from picard.ui.forms.ui_options_network import Ui_NetworkOptionsPage
+from picard.ui.options import (
+    OptionsPage,
+    PageOptionConfigs,
+)
+from picard.ui.util import set_widget_fixed_width_for_text
+
+
+class NetworkOptionsPage(OptionsPage):
+    NAME = 'network'
+    TITLE = N_("Network")
+    PARENT = 'general'
+    SORT_ORDER = 20
+    ACTIVE = True
+    HELP_URL = "/config/options_network.html"
+
+    OPTIONS: ClassVar[PageOptionConfigs] = {
+        'use_proxy': {'widgets': ['web_proxy']},
+        'proxy_type': {'widgets': ['proxy_type_socks', 'proxy_type_http']},
+        'proxy_server_host': {'widgets': ['server_host']},
+        'proxy_server_port': {'widgets': ['server_port']},
+        'proxy_username': {'widgets': ['username']},
+        'proxy_password': {'widgets': ['password']},
+        'network_transfer_timeout_seconds': {'widgets': ['transfer_timeout']},
+        'network_cache_size_bytes': {'widgets': ['network_cache_size']},
+        'browser_integration': {'widgets': ['browser_integration']},
+        'browser_integration_port': {'widgets': ['browser_integration_port']},
+        'browser_integration_localhost_only': {'widgets': ['browser_integration_localhost_only']},
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(parent=parent)
+        self.ui = Ui_NetworkOptionsPage()
+        self.ui.setupUi(self)
+        set_widget_fixed_width_for_text(self.ui.network_cache_size, "99999", padding=12)
+        self.ui.clear_network_cache.clicked.connect(self.clear_cache)
+        self.ui.clear_network_cache.setToolTip(_("Remove all locally cached network requests"))
+        self.ui.current_cache_size.setToolTip(_("Current size of the local network disk cache"))
+        default_size_mb = int(DEFAULT_CACHE_SIZE_IN_BYTES / CACHE_SIZE_DISPLAY_UNIT)
+        max_cache_tooltip = (
+            _("Maximum size of the network cache. A negative value resets to the default size (%d MB).")
+            % default_size_mb
+        )
+        self.ui.network_cache_size.setToolTip(max_cache_tooltip)
+        self.ui.label_cache_size.setToolTip(max_cache_tooltip)
+        self.ui.label_cache_max_unit.setToolTip(max_cache_tooltip)
+        # Keep the spinbox ranges in sync with the option bounds (single source
+        # of truth). The proxy port reuses the server_port spinbox widget.
+        self.apply_option_bounds(self.ui.server_port, 'proxy_server_port')
+        self.apply_option_bounds(self.ui.transfer_timeout, 'network_transfer_timeout_seconds')
+        self.apply_option_bounds(self.ui.browser_integration_port, 'browser_integration_port')
+        self.update_cache_size()
+
+    def load(self):
+        config = get_config()
+        self.ui.web_proxy.setChecked(config.setting['use_proxy'])
+        if config.setting['proxy_type'] == 'socks':
+            self.ui.proxy_type_socks.setChecked(True)
+        else:
+            self.ui.proxy_type_http.setChecked(True)
+        self.ui.server_host.setText(config.setting['proxy_server_host'])
+        self.ui.server_port.setValue(config.setting['proxy_server_port'])
+        self.ui.username.setText(config.setting['proxy_username'])
+        self.ui.password.setText(config.setting['proxy_password'])
+        self.ui.transfer_timeout.setValue(config.setting['network_transfer_timeout_seconds'])
+        self.ui.browser_integration.setChecked(config.setting['browser_integration'])
+        self.ui.browser_integration_port.setValue(config.setting['browser_integration_port'])
+        self.ui.browser_integration_localhost_only.setChecked(config.setting['browser_integration_localhost_only'])
+        self.cachesize2display(config)
+
+    def save(self):
+        config = get_config()
+        config.setting['use_proxy'] = self.ui.web_proxy.isChecked()
+        if self.ui.proxy_type_socks.isChecked():
+            config.setting['proxy_type'] = 'socks'
+        else:
+            config.setting['proxy_type'] = 'http'
+        config.setting['proxy_server_host'] = self.ui.server_host.text()
+        config.setting['proxy_server_port'] = self.ui.server_port.value()
+        config.setting['proxy_username'] = self.ui.username.text()
+        config.setting['proxy_password'] = self.ui.password.text()
+        self.tagger.webservice.setup_proxy()
+        transfer_timeout = self.ui.transfer_timeout.value()
+        config.setting['network_transfer_timeout_seconds'] = transfer_timeout
+        self.tagger.webservice.set_transfer_timeout(transfer_timeout)
+        config.setting['browser_integration'] = self.ui.browser_integration.isChecked()
+        config.setting['browser_integration_port'] = self.ui.browser_integration_port.value()
+        config.setting['browser_integration_localhost_only'] = self.ui.browser_integration_localhost_only.isChecked()
+        self.tagger.update_browser_integration()
+        self.display2cachesize(config)
+
+    def display2cachesize(self, config):
+        try:
+            cache_size = int(self.ui.network_cache_size.text())
+        except ValueError:
+            return
+        config.setting['network_cache_size_bytes'] = int(cache_size * CACHE_SIZE_DISPLAY_UNIT)
+        self.tagger.webservice.set_cache_size()
+
+    def cachesize2display(self, config):
+        cache_size = self.tagger.webservice.get_valid_cache_size()
+        value = int(cache_size / CACHE_SIZE_DISPLAY_UNIT)
+        self.ui.network_cache_size.setText(str(value))
+
+    def update_cache_size(self):
+        size = self.tagger.webservice.get_cache_size()
+        self.ui.current_cache_size.setText(bytes2human.decimal(size))
+        self.ui.clear_network_cache.setEnabled(size > 0)
+
+    def clear_cache(self):
+        self.tagger.webservice.clear_cache()
+        self.update_cache_size()
+
+
+register_options_page(NetworkOptionsPage)

@@ -1,0 +1,1041 @@
+# Picard, the next-generation MusicBrainz tagger
+#
+# Copyright (C) 2006-2007, 2014, 2017 Lukáš Lalinský
+# Copyright (C) 2008, 2014, 2019-2026 Philipp Wolfer
+# Copyright (C) 2012, 2017 Wieland Hoffmann
+# Copyright (C) 2012-2014 Michael Wiencek
+# Copyright (C) 2013-2016, 2018-2026 Laurent Monin
+# Copyright (C) 2016 Suhas
+# Copyright (C) 2016-2018 Sambhav Kothari
+# Copyright (C) 2017 Sophist-UK
+# Copyright (C) 2018 Vishal Choudhary
+# Copyright (C) 2020-2021 Gabriel Ferreira
+# Copyright (C) 2021-2026 Bob Swift
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+
+from collections import (
+    defaultdict,
+    namedtuple,
+)
+from contextlib import contextmanager
+from enum import (
+    Enum,
+    IntEnum,
+)
+import os
+import shutil
+from typing import (
+    Any,
+    ClassVar,
+    TypeAlias,
+)
+
+from PyQt6 import QtCore
+
+from picard import (
+    PICARD_APP_NAME,
+    PICARD_ORG_NAME,
+    PICARD_VERSION,
+    log,
+    tagger_instance,
+)
+from picard.profile import (
+    profile_groups_add_setting,
+    setting_profile_key,
+)
+from picard.version import Version
+
+
+ConfigValueType: TypeAlias = str | int | float | bool | list | tuple | dict | Enum | QtCore.QByteArray
+
+
+class Option(QtCore.QObject):
+    """Generic option."""
+
+    registry: ClassVar[dict[tuple[str, str], 'Option']] = {}
+    qtype: object = None
+
+    def __init__(
+        self,
+        section: str,
+        name: str,
+        default: ConfigValueType,
+        title: str | None = None,
+        in_profile: bool = False,
+        shareable: bool = True,
+    ):
+        super().__init__()
+        self.section = section
+        self.name = name
+        self.default = default
+        self.title = title
+        self.in_profile = in_profile
+        self.shareable = shareable
+        if in_profile and not title:
+            log.warning("Option '%s/%s' has in_profile=True but no title", section, name)
+        self.registry[(section, name)] = self
+
+        self._check_if_valid()
+
+    def _do_logging(self, expected):
+        log.warning("Invalid Option definition for %s/%s: should be %s", self.section, self.name, expected.__name__)
+
+    def _check_if_valid(self):
+        """Check if the option should be sub-classed, and log a warning."""
+        tests: dict[type, type[Option]] = {
+            str: TextOption,
+            bool: BoolOption,
+            int: IntOption,
+            float: FloatOption,
+            list: ListOption,
+            tuple: ListOption,
+            dict: Option,
+        }
+
+        subclass_tests = {
+            IntEnum: IntOption,
+            QtCore.QByteArray: Option,
+        }
+
+        t = type(self.default)
+        if t in tests:
+            if self.__class__ != tests[t]:
+                self._do_logging(tests[t])
+        else:
+            for base, expected in subclass_tests.items():
+                if issubclass(t, base) and self.__class__ != expected:
+                    self._do_logging(expected)
+                    break
+
+    @classmethod
+    def get(cls, section: str, name: str) -> 'Option | None':
+        return cls.registry.get((section, name))
+
+    @classmethod
+    def get_default(cls, section: str, name: str) -> ConfigValueType:
+        opt = cls.get(section, name)
+        if opt is None:
+            raise OptionError("No such option", section, name)
+        return opt.default
+
+    @classmethod
+    def get_title(cls, section: str, name: str) -> str | None:
+        opt = cls.get(section, name)
+        if opt is None:
+            raise OptionError("No such option", section, name)
+        return opt.title
+
+    @classmethod
+    def add_if_missing(cls, section: str, name: str, default: ConfigValueType, *args, **kwargs):
+        if not cls.exists(section, name):
+            cls(section, name, default, *args, **kwargs)
+
+    @classmethod
+    def exists(cls, section: str, name: str) -> bool:
+        return (section, name) in cls.registry
+
+    def convert(self, value: Any):
+        if isinstance(self.default, Enum):
+            # Convert underlying value type first
+            value = type(self.default.value)(value)
+        return type(self.default)(value)
+
+    def unregister(self):
+        del self.registry[(self.section, self.name)]
+
+
+class TextOption(Option):
+    convert = str  # type: ignore[assignment]
+    qtype = 'QString'
+
+
+class BoolOption(Option):
+    convert = bool  # type: ignore[assignment]
+    qtype = bool
+
+
+class OutOfBoundsError(ValueError):
+    """Raised when an option value falls outside its declared bounds.
+
+    Carries the offending ``value`` and the ``corrected`` value (the nearest
+    bound for a numeric option, or the option default for an invalid enum
+    member) so a caller can choose its own policy: clamp to ``corrected``, keep
+    the original, reject it, etc. Subclasses :class:`ValueError` so existing
+    ``except ValueError`` handlers keep working.
+    """
+
+    def __init__(self, option: 'Option', value: Any, corrected: Any):
+        self.option = option
+        self.value = value
+        self.corrected = corrected
+        super().__init__(
+            f"Option '{option.section}/{option.name}': value {value!r} is out of bounds, corrected to {corrected!r}"
+        )
+
+
+class NumericOptionBounds:
+    """Inclusive numeric bounds for an option.
+
+    A bound of ``None`` means unbounded on that side. :meth:`check` detects a
+    value outside the range and raises :class:`OutOfBoundsError` carrying the
+    nearest bound; :meth:`clamp` applies the default "auto-correct" policy on
+    top of :meth:`check`, returning the nearest bound and logging a warning.
+    Because an out-of-range stored value is unexpected (e.g. from a hand-edited
+    configuration file), clamping is reported with a warning so it can be
+    diagnosed.
+    """
+
+    def __init__(self, minimum: float | None = None, maximum: float | None = None):
+        self.minimum = self._check(minimum)
+        self.maximum = self._check(maximum)
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise ValueError(f"minimum {self.minimum!r} is greater than maximum {self.maximum!r}")
+
+    def _check(self, value):
+        if value is None:
+            return None
+        # bool is a subclass of int but is never a valid numeric bound.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"Bound {value!r} is not a numeric value")
+        return value
+
+    def check(self, value, option):
+        """Return value unchanged, or raise OutOfBoundsError if out of range.
+
+        Pure detection with no side effects. The raised error carries the
+        nearest bound as its ``corrected`` value so a caller can decide what to
+        do about the violation.
+        """
+        if self.minimum is not None and value < self.minimum:
+            raise OutOfBoundsError(option, value, self.minimum)
+        if self.maximum is not None and value > self.maximum:
+            raise OutOfBoundsError(option, value, self.maximum)
+        return value
+
+    def clamp(self, value, option):
+        """Clamp value to the bounds, warning (via option context) if out of range.
+
+        This is the default "auto-correct" policy used when reading an option:
+        an out-of-range value is corrected to the nearest bound and a warning is
+        logged.
+        """
+        try:
+            return self.check(value, option)
+        except OutOfBoundsError as e:
+            log.warning(
+                "Option '%s/%s': value %r is out of bounds [%r, %r], clamping to %r",
+                option.section,
+                option.name,
+                e.value,
+                self.minimum,
+                self.maximum,
+                e.corrected,
+            )
+            return e.corrected
+
+
+class BoundedNumberOption(Option):
+    """Base for numeric options that can be constrained to a range.
+
+    Pass ``bounds=(minimum, maximum)`` to constrain the value; either element
+    may be ``None`` to leave that side unbounded. A stored value outside the
+    range is clamped to the nearest bound on read.
+    """
+
+    # Subclasses should set this to int or float
+    _base_type: ClassVar[type[float | int]]
+
+    def __init__(
+        self,
+        section: str,
+        name: str,
+        default: ConfigValueType,
+        title: str | None = None,
+        in_profile: bool = False,
+        shareable: bool = True,
+        bounds: tuple[float | None, float | None] = (None, None),
+    ):
+        minimum, maximum = bounds
+        self.bounds = NumericOptionBounds(minimum, maximum)
+        super().__init__(section, name, default, title, in_profile, shareable)
+
+    def checked_convert(self, value):
+        """Convert value, raising OutOfBoundsError if it violates the bounds.
+
+        Unlike :meth:`convert` (which auto-corrects and warns), this reports a
+        violation to the caller so it can apply its own policy. Callers that want the
+        default auto-correct policy should use :meth:`convert` instead.
+        """
+        # Coerce to the numeric base type first: a value read from an INI config
+        # is a string, and the bounds comparison requires a number.
+        value = self._base_type(value)
+        try:
+            return self._base_type(self.bounds.check(value, self))
+        except OutOfBoundsError as e:
+            # Bounds may be declared as int or float on any option; make the
+            # corrected value match the option type (e.g. int option, float
+            # bound) so callers never see a value of the wrong type.
+            raise OutOfBoundsError(self, e.value, self._base_type(e.corrected)) from None
+
+    def convert(self, value):
+        # Default policy: clamp to the nearest bound and warn (see
+        # NumericOptionBounds.clamp).
+        return self._base_type(self.bounds.clamp(self._base_type(value), self))
+
+
+class IntOption(BoundedNumberOption):
+    _base_type = int
+
+    def checked_convert(self, value):
+        """Convert value, raising OutOfBoundsError if it violates the bounds.
+
+        For an IntEnum option the value must be a valid member; an invalid
+        member raises OutOfBoundsError whose ``corrected`` value is the option
+        default. For a plain int the numeric bounds are enforced via
+        :meth:`NumericOptionBounds.check`. Callers that want the default
+        auto-correct policy should use :meth:`convert` instead.
+        """
+        value = int(value)
+        # Bounds do not apply to enum options (an enum is a set of members, not
+        # an ordered range); the value must instead be a valid member.
+        if isinstance(self.default, IntEnum):
+            enum_type = type(self.default)
+            try:
+                return enum_type(value)
+            except ValueError:
+                raise OutOfBoundsError(self, value, self.default) from None
+        return super().checked_convert(value)
+
+    def convert(self, value):
+        # Default policy: an out-of-range value (or an invalid enum member) is
+        # corrected to the nearest bound / the option default and reported with
+        # a warning, mirroring NumericOptionBounds.clamp. This keeps a stale value
+        # (e.g. from a hand-edited config or an outdated profile) usable on read.
+        if isinstance(self.default, IntEnum):
+            try:
+                return self.checked_convert(value)
+            except OutOfBoundsError as e:
+                log.warning(
+                    "Option '%s/%s': %r is not a valid %s, using default %r",
+                    self.section,
+                    self.name,
+                    e.value,
+                    type(self.default).__name__,
+                    e.corrected,
+                )
+                return e.corrected
+        else:
+            return super().convert(value)
+
+
+class FloatOption(BoundedNumberOption):
+    _base_type = float
+
+
+class ListOption(Option):
+    def convert(self, value):
+        if value is None:
+            return []
+        elif isinstance(value, str):
+            raise ValueError('Expected list or list like object, got "%r"' % value)
+        return list(value)
+
+
+class Memovar:
+    def __init__(self):
+        self.dirty = True
+        self.value: ConfigValueType | None = None
+
+
+class ConfigUpgradeError(Exception):
+    pass
+
+
+_SENTINEL = object()
+
+
+class ConfigSection(QtCore.QObject):
+    """Pure key-value configuration storage.
+
+    Provides typed option access with memoization. No profile awareness —
+    reads and writes go directly to/from the underlying QSettings store.
+    Used for sections that don't participate in profiles (e.g. 'persist', 'profiles').
+    """
+
+    # Signal emitted when the value of a setting has changed.
+    setting_changed = QtCore.pyqtSignal(str, object, object)
+
+    def __init__(self, config: 'Config', name: str):
+        super().__init__()
+        self.__qt_config = config
+        self.__name = name
+        self.__prefix = self.__name + '/'
+        self._memoization: dict[str, Memovar] = defaultdict(Memovar)
+        self.display_name: str | None = None
+
+    @property
+    def section_name(self) -> str:
+        """The name of this config section."""
+        return self.__name
+
+    def key(self, name):
+        return self.__prefix + name
+
+    def __getitem__(self, name: str) -> Any:
+        opt = Option.get(self.__name, name)
+        if opt is None:
+            return None
+        return self.value(opt, opt.default)
+
+    def __setitem__(self, name: str, value: Any):
+        old_value = self.__getitem__(name)
+        key = self.key(name)
+        if isinstance(value, Enum):
+            value = value.value
+        self.__qt_config.setValue(key, value)
+        self._memoization[key].dirty = True
+        if value != old_value:
+            self.setting_changed.emit(name, old_value, value)
+
+    def __contains__(self, name):
+        return self.__qt_config.contains(self.key(name))
+
+    def as_dict(self):
+        return {key: self[key] for section, key in list(Option.registry) if section == self.__name}
+
+    def remove(self, name: str):
+        key = self.key(name)
+        config = self.__qt_config
+        if config.contains(key):
+            config.remove(key)
+        try:
+            del self._memoization[key]
+        except KeyError:
+            pass
+
+    def raw_value(self, name: str, qtype: Any = None):
+        """Return an option value without any type conversion."""
+        key = self.key(name)
+        if qtype is not None:
+            value = self.__qt_config.value(key, type=qtype)
+        else:
+            value = self.__qt_config.value(key)
+        return value
+
+    def value(self, option: Option, default: ConfigValueType | None = None) -> Any:
+        """Return an option value converted to the given Option type."""
+        name = option.name
+        if default is None:
+            default = option.default
+        if name in self:
+            key = self.key(name)
+            memovar = self._memoization[key]
+
+            if memovar.dirty:
+                try:
+                    value = self.raw_value(name, qtype=option.qtype)
+                    value = option.convert(value)
+                    memovar.dirty = False
+                    memovar.value = value
+                except Exception as why:
+                    log.error('Cannot read %s value: %s', self.key(name), why, exc_info=True)
+                    value = default
+                return value
+            else:
+                return memovar.value
+        return default
+
+    def register_option(
+        self,
+        name: str,
+        default: ConfigValueType,
+        title: str | None = None,
+        in_profile: bool = False,
+        bounds: tuple[float | None, float | None] | None = None,
+    ) -> 'Option':
+        """Register an option in this config section.
+
+        The option type is determined by the type of the default value.
+
+        Args:
+            name: Option name.
+            default: Default value. Must not be None. Type determines the Option subclass.
+            title: Human-readable title (used by ProfileConfigSection for profiles UI).
+            in_profile: If True, the option can be overridden by user profiles
+                (only effective in ProfileConfigSection).
+            bounds: Optional ``(minimum, maximum)`` range for numeric options.
+                Only valid for int or float defaults; either element may be
+                None to leave that side unbounded. A stored value outside the
+                range is clamped on read.
+
+        Returns:
+            The registered Option instance.
+
+        Raises:
+            TypeError: If default is None, or if bounds is given for a
+                non-numeric option.
+        """
+        if default is None:
+            raise TypeError('Option default value must not be None')
+
+        if isinstance(default, str):
+            option_type = TextOption
+        elif isinstance(default, bool):
+            option_type = BoolOption  # type: ignore[assignment]
+        elif isinstance(default, int):
+            option_type = IntOption  # type: ignore[assignment]
+        elif isinstance(default, float):
+            option_type = FloatOption  # type: ignore[assignment]
+        elif isinstance(default, (list, tuple)):
+            option_type = ListOption  # type: ignore[assignment]
+        else:
+            option_type = Option  # type: ignore[assignment]
+
+        kwargs: dict[str, Any] = {'title': title, 'in_profile': in_profile}
+        if bounds is not None:
+            if not issubclass(option_type, BoundedNumberOption):
+                raise TypeError('bounds are only valid for int or float options')
+            kwargs['bounds'] = bounds
+
+        return option_type(self.section_name, name, default, **kwargs)
+
+
+class ProfileConfigSection(ConfigSection):
+    """Configuration section with profile override support.
+
+    Reads and writes for options marked with in_profile=True are intercepted:
+    if an active profile overrides the option, the profile value is returned
+    (or written) instead of the base config value.
+
+    Used for plugin configuration sections that participate in profiles.
+    """
+
+    def __init__(self, config: 'Config', name: str):
+        super().__init__(config, name)
+        self.__qt_config = config
+
+    def __getitem__(self, name: str) -> Any:
+        opt = Option.get(self.section_name, name)
+        if opt is None:
+            return None
+        if opt.in_profile:
+            override = self._get_profile_override(name)
+            if override is not _SENTINEL:
+                return opt.convert(override)
+        return self.value(opt, opt.default)
+
+    def _profile_key(self, name: str) -> str:
+        """Return the key for this option in the profile settings dict.
+
+        Core options (section='setting') use bare name for backward compat.
+        Plugin options use 'section/name' (e.g. 'plugin.<uuid>/greeting').
+        """
+        return setting_profile_key(name, self.section_name)
+
+    def _get_all_profile_settings(self):
+        """Return the active profile settings dict, or None if unavailable."""
+        try:
+            setting_section = self.__qt_config.setting
+        except AttributeError:
+            return None
+        if setting_section.settings_override is not None:
+            return setting_section.settings_override
+        return self.__qt_config.profiles[SettingConfigSection.SETTINGS_KEY]
+
+    def _is_settings_override_active(self) -> bool:
+        """Return True if the dialog's settings override is active."""
+        try:
+            return self.__qt_config.setting.settings_override is not None
+        except AttributeError:
+            return False
+
+    def _get_profile_override(self, name: str):
+        """Check active profiles for an override of this option."""
+        all_settings = self._get_all_profile_settings()
+        if not all_settings:
+            return _SENTINEL
+        pkey = self._profile_key(name)
+        for profile_id in self._get_active_profile_ids():
+            settings = all_settings.get(profile_id)
+            if settings and pkey in settings and settings[pkey] is not None:
+                return settings[pkey]
+        return _SENTINEL
+
+    def _get_active_profile_ids(self):
+        """Yield enabled profile IDs from the global profiles list."""
+        try:
+            setting_section = self.__qt_config.setting
+        except AttributeError:
+            return
+        if setting_section.profiles_override is not None:
+            profiles = setting_section.profiles_override
+        else:
+            profiles = self.__qt_config.profiles['user_profiles']
+        if profiles:
+            for profile in profiles:
+                if profile['enabled']:
+                    yield profile['id']
+
+    def __setitem__(self, name: str, value: Any):
+        opt = Option.get(self.section_name, name)
+        if opt and opt.in_profile:
+            if self._set_profile_override(name, value):
+                return
+        super().__setitem__(name, value)
+
+    def _set_profile_override(self, name: str, value) -> bool:
+        """Write value to active profile's settings if the option is overridden there.
+
+        Returns True if the write was intercepted, False otherwise.
+        """
+        all_settings = self._get_all_profile_settings()
+        if not all_settings:
+            return False
+        pkey = self._profile_key(name)
+        is_override = self._is_settings_override_active()
+        if isinstance(value, Enum):
+            value = value.value
+        for profile_id in self._get_active_profile_ids():
+            settings = all_settings.get(profile_id)
+            if settings and pkey in settings:
+                old_value = settings[pkey]
+                settings[pkey] = value
+                if not is_override:
+                    self._save_all_profile_settings(all_settings)
+                if value != old_value:
+                    self.setting_changed.emit(name, old_value, value)
+                return True
+        return False
+
+    def _save_all_profile_settings(self, all_settings: dict):
+        """Persist profile settings to the global profiles section."""
+        key = self.__qt_config.profiles.key(SettingConfigSection.SETTINGS_KEY)
+        self.__qt_config.setValue(key, all_settings)
+        self.__qt_config.profiles._memoization[key].dirty = True
+
+    def register_option(
+        self,
+        name: str,
+        default: ConfigValueType,
+        title: str | None = None,
+        in_profile: bool = False,
+        bounds: tuple[float | None, float | None] | None = None,
+    ) -> Option:
+        """Register an option in this config section.
+
+        Extends the base class method with profile support.
+
+        Args:
+            name: Option name.
+            default: Default value. Must not be None. Type determines the Option subclass.
+            title: Human-readable title for display in profiles and quick menu.
+                Falls back to name if not provided (with a warning for in_profile options).
+            in_profile: If True, the option can be overridden by user profiles.
+            bounds: Optional ``(minimum, maximum)`` range for numeric options.
+                See :meth:`ConfigSection.register_option`.
+
+        Returns:
+            The registered Option instance.
+
+        Raises:
+            TypeError: If default is None, or if bounds is given for a
+                non-numeric option.
+        """
+        opt = super().register_option(name, default, title=title, in_profile=in_profile, bounds=bounds)
+        if in_profile:
+            group_name = self.section_name
+            group_title = self.display_name or self.section_name
+            profile_groups_add_setting(
+                group_name,
+                name,
+                (),
+                title=group_title,
+                parent='plugins',
+                section=self.section_name,
+            )
+        return opt
+
+
+class SettingConfigSection(ProfileConfigSection):
+    """Profile-aware config section with dialog override support.
+
+    Extends ProfileConfigSection with the ability to temporarily override
+    profile data during options dialog editing (profiles_override,
+    settings_override). This is the section used for Picard's global 'setting'.
+    """
+
+    PROFILES_KEY = 'user_profiles'
+    SETTINGS_KEY = 'user_profile_settings'
+
+    @classmethod
+    def init_profile_options(cls):
+        ListOption.add_if_missing('profiles', cls.PROFILES_KEY, [])
+        Option.add_if_missing('profiles', cls.SETTINGS_KEY, {})
+
+    def __init__(self, config: 'Config', name: str):
+        super().__init__(config, name)
+        self.__qt_config = config
+        self.init_profile_options()
+        self.profiles_override = None
+        self.settings_override = None
+
+    def _get_active_profile_ids(self):
+        if self.profiles_override is None:
+            profiles = self.__qt_config.profiles[self.PROFILES_KEY]
+        else:
+            profiles = self.profiles_override
+        if profiles is None:
+            return
+        for profile in profiles:
+            if profile['enabled']:
+                yield profile['id']
+
+    def set_profiles_override(self, new_profiles=None):
+        self.profiles_override = new_profiles
+
+    def set_settings_override(self, new_settings=None):
+        self.settings_override = new_settings
+
+    @contextmanager
+    def no_profile(self):
+        """Context manager that temporarily disables profile lookup."""
+        saved_profiles = self.profiles_override
+        saved_settings = self.settings_override
+        self.profiles_override = []
+        self.settings_override = None
+        try:
+            yield
+        finally:
+            self.profiles_override = saved_profiles
+            self.settings_override = saved_settings
+
+
+# Registry of core options removed from the codebase, purged from existing
+# config files when upgrade hooks run (see Config._remove_obsolete_options).
+# Populated by obsolete_options() calls in config_upgrade_hooks.py, kept here
+# to avoid a config -> config_upgrade import cycle. Each entry is (section,
+# name, obsoleted_in); see obsolete_options() for the semantics.
+_OBSOLETE_OPTIONS: list[tuple[str, str, Version]] = []
+
+
+def obsolete_options(version_str: str, *options: tuple[str, str]) -> None:
+    """Register core option keys that became obsolete in ``version_str``.
+
+    The keys are purged from the config when its upgrade hooks run, if its
+    original version predates ``version_str`` (see
+    :meth:`Config._remove_obsolete_options`). Unlike a versioned upgrade hook —
+    which runs once for configs crossing that boundary — this also cleans
+    configs already stamped at the latest version (e.g. a key that only ever
+    existed during a beta/dev cycle).
+
+    Declare these (from config_upgrade_hooks.py) next to the migration that
+    superseded the option. Each ``options`` argument is a ``(section, name)``
+    tuple naming an exact core option key, never a plugin/namespaced one.
+    """
+    version = Version.from_string(version_str)
+    for section, name in options:
+        _OBSOLETE_OPTIONS.append((section, name, version))
+
+
+class Config(QtCore.QSettings):
+    """Main configuration class based on QSettings.
+
+    Use `Config.from_app` or `Config.from_file` to obtain a new `Config` instance.
+    The class provides several `ConfigSection` instances that hold the actual settings.
+    """
+
+    def __init__(self):
+        # Do not call `QSettings.__init__` here. The proper overloaded `QSettings.__init__`
+        # gets called in `from_app` or `from_config`. Only those class methods must be used
+        # to create a new instance of `Config`.
+        pass
+
+    def __initialize(self):
+        """Common initializer method for :meth:`from_app` and
+        :meth:`from_file`."""
+
+        self.setAtomicSyncRequired(False)  # See comment in event()
+        self.application: ConfigSection = ConfigSection(self, 'application')
+        self.profiles: ConfigSection = ConfigSection(self, 'profiles')
+        self.setting: SettingConfigSection = SettingConfigSection(self, 'setting')
+        self.persist: ConfigSection = ConfigSection(self, 'persist')
+
+        if 'version' not in self.application or not self.application['version']:
+            TextOption('application', 'version', '0.0.0dev0')
+        self._version = Version.from_string(self.application['version'])
+        # Version before any upgrade hook runs; the obsolete-options cleaner's
+        # version guard compares against this (hooks advance self._version).
+        self._original_version = self._version
+
+    @classmethod
+    def from_app(cls, parent):
+        """Build a Config object using the default configuration file
+        location."""
+        this = cls()
+        QtCore.QSettings.__init__(
+            this,
+            QtCore.QSettings.Format.IniFormat,
+            QtCore.QSettings.Scope.UserScope,
+            PICARD_ORG_NAME,
+            PICARD_APP_NAME,
+            parent,
+        )
+
+        # Check if there is a config file specifically for this version
+        versioned_config_file = this._versioned_config_filename(PICARD_VERSION)
+        if os.path.isfile(versioned_config_file):
+            return cls.from_file(parent, versioned_config_file)
+
+        # If there are no settings, copy existing settings from old format
+        # (registry on windows systems)
+        if not this.allKeys():
+            oldFormat = QtCore.QSettings(PICARD_ORG_NAME, PICARD_APP_NAME)
+            for k in oldFormat.allKeys():
+                this.setValue(k, oldFormat.value(k))
+            this.sync()
+
+        this.__initialize()
+        this._backup_settings()
+        return this
+
+    @classmethod
+    def from_file(cls, parent, filename):
+        """Build a Config object using a user-provided configuration file
+        path."""
+        this = cls()
+        QtCore.QSettings.__init__(this, filename, QtCore.QSettings.Format.IniFormat, parent)
+        this.__initialize()
+        return this
+
+    def run_upgrade_hooks(self, hooks):
+        """Executes passed hooks to upgrade config version to the latest.
+
+        The obsolete-options purge is confined to this method and runs only
+        after _run_upgrade_hooks() returns normally. If any hook raises,
+        _run_upgrade_hooks() re-raises it as ConfigUpgradeError before the purge
+        line is reached, so a failed or partial migration never purges. Because
+        this is the sole caller of _remove_obsolete_options(), a partially
+        migrated config left by an earlier failed run is only ever purged once a
+        later run completes every hook.
+        """
+        self._run_upgrade_hooks(hooks)
+        # The config is now fully migrated (every applicable hook ran, and any
+        # value conversion completed): purge options retired in the meantime.
+        self._remove_obsolete_options()
+        self.sync()
+
+    def _run_upgrade_hooks(self, hooks):
+        """Executes passed hooks to upgrade config version to the latest"""
+        if self._version == Version(0, 0, 0, 'dev', 0):
+            # This is a freshly created config
+            self._write_version(PICARD_VERSION)
+            return
+        if not hooks:
+            return
+        if self._version >= PICARD_VERSION:
+            if self._version > PICARD_VERSION:
+                print(
+                    "Warning: config file %s was created by a more recent "
+                    "version of Picard (current is %s)" % (self._version, PICARD_VERSION)
+                )
+            return
+        for version in list(hooks):
+            hook = hooks[version]
+            if self._version < version:
+                try:
+                    if hook.__doc__:
+                        log.debug(
+                            "Config upgrade %s -> %s: %s"
+                            % (
+                                self._version,
+                                version,
+                                hook.__doc__.strip(),
+                            )
+                        )
+                    hook(self)
+                except BaseException as e:
+                    raise ConfigUpgradeError(
+                        "Error during config upgrade from version %s to %s "
+                        "using %s()"
+                        % (
+                            self._version,
+                            version,
+                            hook.__name__,
+                        )
+                    ) from e
+                else:
+                    del hooks[version]
+                    self._write_version(version)
+            else:
+                # hook is not applicable, mark as done
+                del hooks[version]
+
+        if not hooks:
+            # all hooks were executed, ensure config is marked with latest version
+            self._write_version(PICARD_VERSION)
+
+    def _backup_settings(self):
+        if Version(0, 0, 0) < self._version < PICARD_VERSION:
+            backup_path = self._versioned_config_filename()
+            self._save_backup(backup_path)
+
+    def _save_backup(self, backup_path):
+        log.info("Backing up config file to %s", backup_path)
+        try:
+            shutil.copyfile(self.fileName(), backup_path)
+        except OSError:
+            log.error("Failed backing up config file to %s", backup_path)
+            return False
+        return True
+
+    def _write_version(self, new_version):
+        self._version = new_version
+        self.application['version'] = str(self._version)
+        self.sync()
+
+    def _remove_obsolete_options(self):
+        """Purge _OBSOLETE_OPTIONS keys from the config.
+
+        Called once from run_upgrade_hooks() after all upgrade hooks have run,
+        so a to-be-converted option is never dropped before its converter runs,
+        and a failed migration (hook raised) never reaches this point. Two
+        guards remain, each covering a distinct case:
+
+        - version: only remove a key when the config's *original* version
+          (before any upgrade hook ran) predates the version in which the
+          option was obsoleted, so a config old enough to still use the option
+          keeps it.
+        - registry: never remove a currently-registered Option; a
+          (re)registered name is live and holds a valid value. Such a collision
+          is a programming error (caught by the test suite); skip and warn if
+          one reaches a released build.
+        """
+        for section, name, obsoleted_in in _OBSOLETE_OPTIONS:
+            if (section, name) in Option.registry:
+                log.warning(
+                    "Not removing obsolete config option %s/%s: a live option "
+                    "with the same name is registered; remove it from "
+                    "the obsolete_options() declaration",
+                    section,
+                    name,
+                )
+                continue
+            # Skip keys the config is too old to have obsoleted yet.
+            if self._original_version >= obsoleted_in:
+                continue
+            key = '%s/%s' % (section, name)
+            if self.contains(key):
+                log.debug("Removing obsolete config option %s", key)
+                self.remove(key)
+
+    def _versioned_config_filename(self, version=None):
+        if not version:
+            version = self._version
+        return os.path.join(
+            os.path.dirname(self.fileName()), '%s-%s.ini' % (self.applicationName(), version.short_str())
+        )
+
+    def save_user_backup(self, backup_path):
+        if backup_path == self.fileName():
+            log.warning("Attempt to backup configuration file to the same path.")
+            return False
+        return self._save_backup(backup_path)
+
+
+class OptionError(Exception):
+    def __init__(self, message, section, name):
+        super().__init__("Option %s/%s: %s" % (section, name, message))
+
+
+config = None
+setting = None
+persist = None
+profiles = None
+
+
+def setup_config(app=None, filename=None):
+    if app is None:
+        app = tagger_instance()
+    global config, setting, persist, profiles
+    if filename is None:
+        config = Config.from_app(app)
+    else:
+        config = Config.from_file(app, filename)
+    setting = config.setting
+    persist = config.persist
+    profiles = config.profiles
+
+
+def get_config() -> Config:
+    """Returns the global config object."""
+    if not config:
+        raise RuntimeError('config not yet set up')
+    return config
+
+
+def load_new_config(filename: str):
+    config_file = get_config().fileName()
+    try:
+        shutil.copy(filename, config_file)
+    except OSError:
+        log.error("Failed restoring config file from %s", filename)
+        return False
+    setup_config(filename=config_file)
+    return True
+
+
+QuickMenuItem = namedtuple('QuickMenuItem', ['name', 'title'])
+_quick_menu_items: dict[str, dict] = {}
+
+
+def register_quick_menu_item(
+    group_order: int, group_name: str, group_parent: str | None, group_title: str, option: Option
+):
+    """Register a BoolOption for the quick settings menu.
+
+    Only BoolOptions are eligible. Non-bool options are silently skipped.
+    If the option has no title, the option name is used with a warning.
+
+    Args:
+        group_order: Sort order for the group in the menu.
+        group_name: Identifier for the options group (usually the page NAME).
+        group_parent: Parent group name, or None/empty for top-level.
+        group_title: Display title for the group.
+        option: The Option to register. Must have qtype=bool.
+    """
+    if option.qtype is not bool:
+        return
+    # Plugin options are not supported in the quick settings menu yet
+    if option.section != 'setting':
+        return
+    title = option.title
+    if not title:
+        log.warning("BoolOption '%s/%s' has no title, using option name for quick menu", option.section, option.name)
+        title = option.name
+    if group_name not in _quick_menu_items:
+        group_parent = group_parent or ''
+        _quick_menu_items[group_name] = {
+            'order': group_order,
+            'title': group_title,
+            'parent': group_parent,
+            'options': [],
+        }
+    _quick_menu_items[group_name]['options'].append(QuickMenuItem(option.name, title))
+
+
+def get_quick_menu_items():
+    for group, value in sorted(_quick_menu_items.items(), key=lambda x: (x[1]['parent'], x[1]['order'], x[0])):
+        yield {'name': group, 'parent': value['parent'], 'title': value['title'], 'options': value['options']}
